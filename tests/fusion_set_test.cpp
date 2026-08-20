@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -67,6 +69,14 @@ void check_equivalent(const Tree &tree, const Reference &reference) {
     check_optional_iterator(tree.lower_bound(probe), reference.lower_bound(probe), tree.end(),
                             reference.end());
     check_optional_iterator(tree.upper_bound(probe), reference.upper_bound(probe), tree.end(),
+                            reference.end());
+    const auto [actual_equal_begin, actual_equal_end] = tree.equal_range(probe);
+    const auto [expected_equal_begin, expected_equal_end] = reference.equal_range(probe);
+    check_optional_iterator(actual_equal_begin, expected_equal_begin, tree.end(), reference.end());
+    check_optional_iterator(actual_equal_end, expected_equal_end, tree.end(), reference.end());
+    check_optional_iterator(tree.successor(probe), reference.upper_bound(probe), tree.end(),
+                            reference.end());
+    check_optional_iterator(tree.ceiling(probe), reference.lower_bound(probe), tree.end(),
                             reference.end());
 
     auto expected_predecessor = reference.lower_bound(probe);
@@ -224,6 +234,34 @@ void test_randomized(std::uint64_t seed, std::size_t operations) {
   check_equivalent(tree, reference);
 }
 
+template <std::size_t Branching> void test_existing_key_erase(std::uint64_t seed) {
+  fusion_tree::fusion_set<std::uint64_t, Branching> tree;
+  std::set<std::uint64_t> reference;
+  std::vector<std::uint64_t> keys;
+  std::mt19937_64 random(seed);
+  keys.reserve(30'000);
+
+  while (keys.size() != keys.capacity()) {
+    const auto key = random();
+    if (reference.insert(key).second) {
+      tree.insert(key);
+      keys.push_back(key);
+    }
+  }
+  std::ranges::shuffle(keys, random);
+
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    CHECK(tree.erase(keys[i]) == reference.erase(keys[i]));
+    if (i % 113U == 0) {
+      CHECK(tree.validate());
+      CHECK(tree.size() == reference.size());
+      CHECK(std::ranges::equal(tree, reference));
+    }
+  }
+  CHECK(tree.empty());
+  CHECK(tree.validate());
+}
+
 void test_value_semantics_and_ranges() {
   std::vector<std::uint64_t> values{9, 1, 7, 3, 5, 3, 1};
   fusion_tree::fusion_set<std::uint64_t> original;
@@ -300,6 +338,68 @@ public:
   std::shared_ptr<allocation_state> state;
 };
 
+template <class T> class fancy_pointer {
+public:
+  using element_type = T;
+  using difference_type = std::ptrdiff_t;
+  template <class U> using rebind = fancy_pointer<U>;
+
+  constexpr fancy_pointer() noexcept = default;
+  explicit constexpr fancy_pointer(T *pointer) noexcept : pointer_(pointer) {}
+
+  template <class U>
+    requires std::convertible_to<U *, T *>
+  constexpr fancy_pointer(const fancy_pointer<U> &other) noexcept : pointer_(other.get()) {}
+
+  [[nodiscard]] static constexpr fancy_pointer pointer_to(T &value) noexcept {
+    return fancy_pointer{std::addressof(value)};
+  }
+  [[nodiscard]] constexpr T *get() const noexcept { return pointer_; }
+  [[nodiscard]] constexpr T &operator*() const noexcept { return *pointer_; }
+  [[nodiscard]] constexpr T *operator->() const noexcept { return pointer_; }
+  explicit constexpr operator bool() const noexcept { return pointer_ != nullptr; }
+
+  friend constexpr bool operator==(const fancy_pointer &, const fancy_pointer &) noexcept = default;
+  friend constexpr bool operator==(const fancy_pointer &pointer, std::nullptr_t) noexcept {
+    return pointer.pointer_ == nullptr;
+  }
+
+private:
+  template <class U> friend class fancy_pointer;
+  T *pointer_{};
+};
+
+template <class T> class fancy_allocator {
+public:
+  using value_type = T;
+  using pointer = fancy_pointer<T>;
+
+  fancy_allocator() : state(std::make_shared<allocation_state>()) {}
+  explicit fancy_allocator(std::shared_ptr<allocation_state> value) : state(std::move(value)) {}
+
+  template <class U>
+  fancy_allocator(const fancy_allocator<U> &other) noexcept : state(other.state) {}
+
+  [[nodiscard]] pointer allocate(std::size_t count) {
+    state->allocated += count;
+    return pointer{std::allocator<T>{}.allocate(count)};
+  }
+
+  void deallocate(pointer storage, std::size_t count) noexcept {
+    state->deallocated += count;
+    std::allocator<T>{}.deallocate(storage.get(), count);
+  }
+
+  template <class U> friend class fancy_allocator;
+
+  template <class U>
+  friend bool operator==(const fancy_allocator &left, const fancy_allocator<U> &right) noexcept {
+    return left.state == right.state;
+  }
+
+  std::shared_ptr<allocation_state> state;
+};
+
 void test_allocator_and_allocation_failure() {
   auto state = std::make_shared<allocation_state>();
   using allocator = counting_allocator<std::uint64_t>;
@@ -338,6 +438,43 @@ void test_allocator_and_allocation_failure() {
   } catch (const std::bad_alloc &) {
   }
   CHECK(constructor_state->allocated == constructor_state->deallocated);
+
+  using cascading_tree = fusion_tree::fusion_set<std::uint64_t, 3, allocator>;
+  for (std::uint64_t element_count = 1; element_count < 200; ++element_count) {
+    for (std::size_t allocation_budget = 0; allocation_budget < 5; ++allocation_budget) {
+      auto cascade_state = std::make_shared<allocation_state>();
+      {
+        cascading_tree tree{allocator{cascade_state}};
+        for (std::uint64_t key = 0; key < element_count; ++key) {
+          tree.insert(key);
+        }
+        cascade_state->remaining = allocation_budget;
+        try {
+          tree.insert(element_count);
+          CHECK(tree.size() == element_count + 1U);
+        } catch (const std::bad_alloc &) {
+          CHECK(tree.size() == element_count);
+          CHECK(!tree.contains(element_count));
+        }
+        CHECK(tree.validate());
+      }
+      CHECK(cascade_state->allocated == cascade_state->deallocated);
+    }
+  }
+
+  auto fancy_state = std::make_shared<allocation_state>();
+  using fancy_tree = fusion_tree::fusion_set<std::uint64_t, 8, fancy_allocator<std::uint64_t>>;
+  {
+    fancy_tree tree{fancy_allocator<std::uint64_t>{fancy_state}};
+    for (std::uint64_t key = 0; key < 10'000; ++key) {
+      tree.insert(key * 17U);
+    }
+    for (std::uint64_t key = 0; key < 10'000; key += 3U) {
+      tree.erase(key * 17U);
+    }
+    CHECK(tree.validate());
+  }
+  CHECK(fancy_state->allocated == fancy_state->deallocated);
 }
 
 } // namespace
@@ -356,6 +493,8 @@ int main() {
   test_randomized<std::uint16_t, 3>(0x01a2b3c4U, 40'000);
   test_randomized<std::uint32_t, 5>(0xdeadbeefU, 70'000);
   test_randomized<std::uint64_t, 8>(0x123456789abcdef0ULL, 100'000);
+  test_existing_key_erase<3>(0xa54ff53a5f1d36f1ULL);
+  test_existing_key_erase<8>(0x510e527fade682d1ULL);
   test_value_semantics_and_ranges();
   test_allocator_and_allocation_failure();
 

@@ -26,4 +26,6 @@ ctest --test-dir build --output-on-failure
 ```
 
 Enable `FUSION_TREE_ENABLE_SANITIZERS` for ASan/UBSan or
-`FUSION_TREE_BUILD_BENCHMARKS` for the standalone lookup benchmark.
+`FUSION_TREE_BUILD_BENCHMARKS` for the standalone lookup benchmark. On x86-64,
+`FUSION_TREE_ENABLE_BMI2` enables the GCC/Clang `_pext_u64` sketch-extraction
+fast path and requires a BMI2-capable deployment target.

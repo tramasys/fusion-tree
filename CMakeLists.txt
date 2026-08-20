@@ -18,12 +18,23 @@ if(PROJECT_IS_TOP_LEVEL)
   option(FUSION_TREE_BUILD_TESTS "Build the test suite" ON)
   option(FUSION_TREE_BUILD_BENCHMARKS "Build the benchmark" OFF)
   option(FUSION_TREE_ENABLE_SANITIZERS "Enable ASan and UBSan" OFF)
+  option(FUSION_TREE_ENABLE_BMI2 "Require x86-64 BMI2 and use hardware PEXT" OFF)
 else()
   option(FUSION_TREE_BUILD_TESTS "Build the test suite" OFF)
   option(FUSION_TREE_BUILD_BENCHMARKS "Build the benchmark" OFF)
 endif()
 
+if(FUSION_TREE_ENABLE_BMI2)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND
+     CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    target_compile_options(fusion_tree INTERFACE -mbmi2)
+  else()
+    message(FATAL_ERROR "FUSION_TREE_ENABLE_BMI2 requires GCC or Clang targeting x86-64")
+  endif()
+endif()
+
 function(fusion_tree_set_project_options target)
+  set_target_properties(${target} PROPERTIES CXX_EXTENSIONS OFF)
   if(MSVC)
     target_compile_options(${target} PRIVATE /W4 /permissive-)
   else()
@@ -72,4 +83,3 @@ install(
     ${CMAKE_CURRENT_BINARY_DIR}/fusion_treeConfig.cmake
     ${CMAKE_CURRENT_BINARY_DIR}/fusion_treeConfigVersion.cmake
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/fusion_tree)
-

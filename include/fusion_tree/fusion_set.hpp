@@ -17,6 +17,10 @@
 #include <type_traits>
 #include <utility>
 
+#if defined(__BMI2__) && (defined(__x86_64__) || defined(__amd64__) || defined(_M_X64))
+#include <immintrin.h>
+#endif
+
 namespace fusion_tree {
 
 namespace detail {
@@ -28,52 +32,40 @@ template <std::unsigned_integral Key, std::size_t Capacity> class fusion_index {
   static_assert(Capacity >= 1 && Capacity <= 8);
 
 public:
-  constexpr void rebuild(std::span<const Key> keys) noexcept {
+  void rebuild(std::span<const Key> keys) noexcept {
     assert(keys.size() <= Capacity);
 
     size_ = static_cast<std::uint8_t>(keys.size());
-    relevant_count_ = 0;
-    positions_.fill(0);
+    relevant_mask_ = 0;
     packed_ = 0;
-    guard_mask_ = 0;
     repeat_mask_ = 0;
 
     for (std::size_t i = 1; i < keys.size(); ++i) {
       assert(keys[i - 1] < keys[i]);
       const auto difference = static_cast<Key>(keys[i - 1] ^ keys[i]);
       assert(difference != 0);
-      const auto position =
-          static_cast<std::uint8_t>(static_cast<unsigned>(std::bit_width(difference)) - 1U);
-
-      bool already_present = false;
-      for (std::size_t j = 0; j < relevant_count_; ++j) {
-        already_present |= positions_[j] == position;
-      }
-      if (!already_present) {
-        positions_[relevant_count_++] = position;
-      }
+      const auto position = static_cast<unsigned>(std::bit_width(difference)) - 1U;
+      relevant_mask_ |= std::uint64_t{1} << position;
     }
 
-    std::sort(positions_.begin(), positions_.begin() + relevant_count_, std::greater<>{});
+    relevant_count_ = static_cast<std::uint8_t>(std::popcount(relevant_mask_));
     lane_width_ = static_cast<std::uint8_t>(relevant_count_ + 1U);
 
     const auto guard = std::uint64_t{1} << relevant_count_;
     for (std::size_t i = 0; i < keys.size(); ++i) {
       const auto shift = static_cast<unsigned>(i * lane_width_);
       packed_ |= (guard | sketch(keys[i])) << shift;
-      guard_mask_ |= guard << shift;
       repeat_mask_ |= std::uint64_t{1} << shift;
     }
   }
 
-  [[nodiscard]] constexpr std::size_t lower_bound(std::span<const Key> keys,
-                                                  Key query) const noexcept {
+  [[nodiscard]] std::size_t lower_bound(std::span<const Key> keys, Key query) const noexcept {
     assert(keys.size() == size_);
     if (keys.empty()) {
       return 0;
     }
 
-    const auto approximate = sketch_lower_bound(query);
+    const auto approximate = sketch_lower_bound(sketch(query));
     std::size_t closest = 0;
     if (approximate == keys.size()) {
       closest = keys.size() - 1U;
@@ -97,19 +89,19 @@ public:
 
     if (query < keys[closest]) {
       const auto minimum_on_query_side = static_cast<Key>(query & ~lower_bits);
-      return sketch_lower_bound(minimum_on_query_side);
+      return sketch_lower_bound(sketch(minimum_on_query_side));
     }
 
     const auto maximum_on_query_side = static_cast<Key>(query | lower_bits);
-    auto position = sketch_lower_bound(maximum_on_query_side);
-    if (position != keys.size() && sketch(keys[position]) == sketch(maximum_on_query_side)) {
+    const auto maximum_sketch = sketch(maximum_on_query_side);
+    auto position = sketch_lower_bound(maximum_sketch);
+    if (position != keys.size() && sketch(keys[position]) == maximum_sketch) {
       ++position;
     }
     return position;
   }
 
-  [[nodiscard]] constexpr std::size_t upper_bound(std::span<const Key> keys,
-                                                  Key query) const noexcept {
+  [[nodiscard]] std::size_t upper_bound(std::span<const Key> keys, Key query) const noexcept {
     assert(keys.size() == size_);
     auto position = lower_bound(keys, query);
     if (position != keys.size() && keys[position] == query) {
@@ -118,24 +110,33 @@ public:
     return position;
   }
 
-  friend constexpr bool operator==(const fusion_index &, const fusion_index &) noexcept = default;
+  friend bool operator==(const fusion_index &, const fusion_index &) noexcept = default;
 
 private:
-  [[nodiscard]] constexpr std::uint64_t sketch(Key key) const noexcept {
+  [[nodiscard]] std::uint64_t sketch(Key key) const noexcept {
+#if defined(__BMI2__) && (defined(__x86_64__) || defined(__amd64__) || defined(_M_X64))
+    return _pext_u64(static_cast<std::uint64_t>(key), relevant_mask_);
+#else
+    auto mask = relevant_mask_;
     std::uint64_t result = 0;
-    for (std::size_t i = 0; i < relevant_count_; ++i) {
-      result = (result << 1U) | ((static_cast<std::uint64_t>(key) >> positions_[i]) & 1U);
+    std::uint64_t output_bit = 1;
+    while (mask != 0) {
+      const auto input_bit = mask & (~mask + 1U);
+      result |= (static_cast<std::uint64_t>(key) & input_bit) != 0 ? output_bit : 0;
+      mask &= mask - 1U;
+      output_bit <<= 1U;
     }
     return result;
+#endif
   }
 
-  [[nodiscard]] constexpr std::size_t sketch_lower_bound(Key query) const noexcept {
+  [[nodiscard]] std::size_t sketch_lower_bound(std::uint64_t query_sketch) const noexcept {
     if (size_ == 0) {
       return 0;
     }
 
-    const auto differences = packed_ - sketch(query) * repeat_mask_;
-    const auto greater_or_equal = differences & guard_mask_;
+    const auto differences = packed_ - query_sketch * repeat_mask_;
+    const auto greater_or_equal = differences & (repeat_mask_ << relevant_count_);
     if (greater_or_equal == 0) {
       return size_;
     }
@@ -143,9 +144,8 @@ private:
            static_cast<std::size_t>(lane_width_);
   }
 
-  std::array<std::uint8_t, Capacity - 1> positions_{};
+  std::uint64_t relevant_mask_{};
   std::uint64_t packed_{};
-  std::uint64_t guard_mask_{};
   std::uint64_t repeat_mask_{};
   std::uint8_t size_{};
   std::uint8_t relevant_count_{};
@@ -168,22 +168,38 @@ class fusion_set {
   static_assert(std::same_as<typename std::allocator_traits<Allocator>::value_type, Key>,
                 "Allocator::value_type must be the key type");
 
+  struct internal_node;
+
   struct node {
     explicit constexpr node(bool leaf) noexcept : is_leaf(leaf) {}
 
-    std::array<Key, Branching + 1> keys{};
-    std::array<node *, Branching + 1> children{};
     detail::fusion_index<Key, Branching> index{};
-    node *parent{};
-    node *previous{};
-    node *next{};
+    internal_node *parent{};
+    Key minimum{};
     std::uint8_t count{};
     bool is_leaf{};
   };
 
+  struct leaf_node final : node {
+    constexpr leaf_node() noexcept : node(true) {}
+
+    std::array<Key, Branching + 1> keys{};
+    leaf_node *previous{};
+    leaf_node *next{};
+  };
+
+  struct internal_node final : node {
+    constexpr internal_node() noexcept : node(false) {}
+
+    std::array<Key, Branching> keys{};
+    std::array<node *, Branching + 1> children{};
+  };
+
   using allocator_traits = std::allocator_traits<Allocator>;
-  using node_allocator = typename allocator_traits::template rebind_alloc<node>;
-  using node_allocator_traits = std::allocator_traits<node_allocator>;
+  using leaf_allocator = typename allocator_traits::template rebind_alloc<leaf_node>;
+  using leaf_allocator_traits = std::allocator_traits<leaf_allocator>;
+  using internal_allocator = typename allocator_traits::template rebind_alloc<internal_node>;
+  using internal_allocator_traits = std::allocator_traits<internal_allocator>;
 
 public:
   using key_type = Key;
@@ -258,11 +274,12 @@ public:
                                      const const_iterator &) noexcept = default;
 
   private:
-    constexpr const_iterator(const fusion_set *owner, const node *leaf, size_type position) noexcept
+    constexpr const_iterator(const fusion_set *owner, const leaf_node *leaf,
+                             size_type position) noexcept
         : owner_(owner), leaf_(leaf), position_(position) {}
 
     const fusion_set *owner_{};
-    const node *leaf_{};
+    const leaf_node *leaf_{};
     size_type position_{};
   };
 
@@ -398,7 +415,7 @@ public:
 
   std::pair<iterator, bool> insert(key_type key) {
     if (root_ == nullptr) {
-      node *new_root = create_node(true);
+      leaf_node *new_root = create_leaf();
       new_root->keys[0] = key;
       new_root->count = 1;
       refresh(new_root);
@@ -407,7 +424,7 @@ public:
       return {iterator{this, new_root, 0}, true};
     }
 
-    node *leaf = find_leaf(key);
+    leaf_node *leaf = find_leaf(key);
     const auto keys = key_span(leaf);
     const auto position = leaf->index.lower_bound(keys, key);
     if (position != leaf->count && leaf->keys[position] == key) {
@@ -415,84 +432,17 @@ public:
     }
 
     if (leaf->count < Branching) {
+      const bool minimum_changed = position == 0;
       insert_key(leaf, position, key);
       ++size_;
-      refresh_upward(leaf);
+      refresh(leaf);
+      if (minimum_changed) {
+        propagate_minimum(leaf);
+      }
       return {iterator{this, leaf, position}, true};
     }
 
-    constexpr auto maximum_allocations = std::numeric_limits<size_type>::digits + 2U;
-    std::array<node *, maximum_allocations> prepared{};
-    size_type prepared_count = 0;
-    size_type needed = 0;
-    for (node *current = leaf; current != nullptr && current->count == Branching;
-         current = current->parent) {
-      ++needed;
-    }
-    node *first_non_full = leaf;
-    while (first_non_full != nullptr && first_non_full->count == Branching) {
-      first_non_full = first_non_full->parent;
-    }
-    if (first_non_full == nullptr) {
-      ++needed;
-    }
-    assert(needed <= prepared.size());
-
-    try {
-      while (prepared_count != needed) {
-        prepared[prepared_count++] = create_node(false);
-      }
-    } catch (...) {
-      while (prepared_count != 0) {
-        destroy_node(prepared[--prepared_count]);
-      }
-      throw;
-    }
-
-    size_type used = 0;
-    const auto take_prepared = [&]() noexcept -> node * {
-      assert(used < prepared_count);
-      return prepared[used++];
-    };
-
-    insert_key(leaf, position, key);
-    node *current = leaf;
-    while (current->count > Branching) {
-      node *right = take_prepared();
-      split_node(current, right);
-      node *parent = current->parent;
-
-      if (parent == nullptr) {
-        node *new_root = take_prepared();
-        new_root->is_leaf = false;
-        new_root->count = 2;
-        new_root->children[0] = current;
-        new_root->children[1] = right;
-        current->parent = new_root;
-        right->parent = new_root;
-        refresh(new_root);
-        root_ = new_root;
-        break;
-      }
-
-      const auto child_position = index_of_child(parent, current);
-      for (size_type i = parent->count; i > child_position + 1U; --i) {
-        parent->children[i] = parent->children[i - 1U];
-      }
-      parent->children[child_position + 1U] = right;
-      right->parent = parent;
-      ++parent->count;
-
-      if (parent->count <= Branching) {
-        refresh_upward(parent);
-        break;
-      }
-      current = parent;
-    }
-
-    assert(used == prepared_count);
-    ++size_;
-    return {find(key), true};
+    return {insert_into_full_leaf(leaf, position, key), true};
   }
 
   template <std::input_iterator Iterator, std::sentinel_for<Iterator> Sentinel>
@@ -514,12 +464,13 @@ public:
       return 0;
     }
 
-    node *leaf = find_leaf(key);
+    leaf_node *leaf = find_leaf(key);
     const auto position = leaf->index.lower_bound(key_span(leaf), key);
     if (position == leaf->count || leaf->keys[position] != key) {
       return 0;
     }
 
+    const bool minimum_changed = position == 0;
     for (size_type i = position + 1U; i < leaf->count; ++i) {
       leaf->keys[i - 1U] = leaf->keys[i];
     }
@@ -537,9 +488,12 @@ public:
     }
 
     if (leaf->count >= minimum_occupancy) {
-      refresh_upward(leaf);
+      refresh(leaf);
+      if (minimum_changed) {
+        propagate_minimum(leaf);
+      }
     } else {
-      rebalance_after_erase(leaf);
+      rebalance_after_erase(leaf, minimum_changed);
     }
     return 1;
   }
@@ -563,7 +517,7 @@ public:
     if (root_ == nullptr) {
       return end();
     }
-    const node *leaf = find_leaf(key);
+    const leaf_node *leaf = find_leaf(key);
     const auto position = leaf->index.lower_bound(key_span(leaf), key);
     return position != leaf->count && leaf->keys[position] == key ? iterator{this, leaf, position}
                                                                   : end();
@@ -576,28 +530,29 @@ public:
     if (root_ == nullptr) {
       return end();
     }
-    const node *leaf = find_leaf(key);
+    const leaf_node *leaf = find_leaf(key);
     const auto position = leaf->index.lower_bound(key_span(leaf), key);
-    if (position != leaf->count) {
-      return iterator{this, leaf, position};
-    }
-    return iterator{this, leaf->next, 0};
+    return iterator_at(leaf, position);
   }
 
   [[nodiscard]] iterator upper_bound(key_type key) const noexcept {
     if (root_ == nullptr) {
       return end();
     }
-    const node *leaf = find_leaf(key);
+    const leaf_node *leaf = find_leaf(key);
     const auto position = leaf->index.upper_bound(key_span(leaf), key);
-    if (position != leaf->count) {
-      return iterator{this, leaf, position};
-    }
-    return iterator{this, leaf->next, 0};
+    return iterator_at(leaf, position);
   }
 
   [[nodiscard]] std::pair<iterator, iterator> equal_range(key_type key) const noexcept {
-    return {lower_bound(key), upper_bound(key)};
+    if (root_ == nullptr) {
+      return {end(), end()};
+    }
+    const leaf_node *leaf = find_leaf(key);
+    const auto lower = leaf->index.lower_bound(key_span(leaf), key);
+    const auto upper =
+        lower + static_cast<size_type>(lower != leaf->count && leaf->keys[lower] == key);
+    return {iterator_at(leaf, lower), iterator_at(leaf, upper)};
   }
 
   // Strict predecessor/successor queries. floor() and ceiling() are the
@@ -650,7 +605,7 @@ public:
 
     size_type observed_size = 0;
     size_type leaf_depth = std::numeric_limits<size_type>::max();
-    const node *previous_leaf = nullptr;
+    const leaf_node *previous_leaf = nullptr;
     std::optional<key_type> previous_key;
 
     const auto inspect = [&](const auto &self, const node *current, size_type depth,
@@ -660,6 +615,7 @@ public:
       }
 
       if (current->is_leaf) {
+        const auto *leaf = static_cast<const leaf_node *>(current);
         if (!is_root && current->count < minimum_occupancy) {
           return false;
         }
@@ -668,25 +624,24 @@ public:
         } else if (leaf_depth != depth) {
           return false;
         }
-        if ((previous_leaf == nullptr && current != first_leaf_) ||
-            current->previous != previous_leaf ||
+        if ((previous_leaf == nullptr && leaf != first_leaf_) || leaf->previous != previous_leaf ||
             (previous_leaf != nullptr && previous_leaf->next != current)) {
           return false;
         }
 
         detail::fusion_index<Key, Branching> expected;
-        expected.rebuild(key_span(current));
-        if (expected != current->index) {
+        expected.rebuild(key_span(leaf));
+        if (expected != current->index || current->minimum != leaf->keys[0]) {
           return false;
         }
         for (size_type i = 0; i < current->count; ++i) {
-          if (previous_key && *previous_key >= current->keys[i]) {
+          if (previous_key && *previous_key >= leaf->keys[i]) {
             return false;
           }
-          previous_key = current->keys[i];
+          previous_key = leaf->keys[i];
           ++observed_size;
         }
-        previous_leaf = current;
+        previous_leaf = leaf;
         return true;
       }
 
@@ -694,20 +649,21 @@ public:
         return false;
       }
 
+      const auto *internal = static_cast<const internal_node *>(current);
       detail::fusion_index<Key, Branching> expected;
-      expected.rebuild(internal_key_span(current));
-      if (expected != current->index) {
+      expected.rebuild(internal_key_span(internal));
+      if (expected != current->index || current->minimum != internal->children[0]->minimum) {
         return false;
       }
 
       for (size_type i = 0; i < current->count; ++i) {
-        if (current->children[i] == nullptr || current->children[i]->parent != current) {
+        if (internal->children[i] == nullptr || internal->children[i]->parent != current) {
           return false;
         }
-        if (i != 0 && current->keys[i - 1U] != subtree_min(current->children[i])) {
+        if (i != 0 && internal->keys[i - 1U] != subtree_min(internal->children[i])) {
           return false;
         }
-        if (!self(self, current->children[i], depth + 1U, false)) {
+        if (!self(self, internal->children[i], depth + 1U, false)) {
           return false;
         }
       }
@@ -729,32 +685,71 @@ public:
 private:
   static constexpr size_type minimum_occupancy = (Branching + 1U) / 2U;
 
-  [[nodiscard]] static constexpr std::span<const key_type> key_span(const node *current) noexcept {
+  [[nodiscard]] static constexpr std::span<const key_type>
+  key_span(const leaf_node *current) noexcept {
     return {current->keys.data(), current->count};
   }
 
   [[nodiscard]] static constexpr std::span<const key_type>
-  internal_key_span(const node *current) noexcept {
-    assert(!current->is_leaf && current->count >= 1);
+  internal_key_span(const internal_node *current) noexcept {
+    assert(current->count >= 1);
     return {current->keys.data(), static_cast<size_type>(current->count - 1U)};
   }
 
-  [[nodiscard]] node *create_node(bool leaf) {
-    node_allocator allocator{allocator_};
-    node *result = node_allocator_traits::allocate(allocator, 1);
+  [[nodiscard]] constexpr iterator iterator_at(const leaf_node *leaf,
+                                               size_type position) const noexcept {
+    assert(position <= leaf->count);
+    return position != leaf->count ? iterator{this, leaf, position} : iterator{this, leaf->next, 0};
+  }
+
+  [[nodiscard]] leaf_node *create_leaf() {
+    leaf_allocator allocator{allocator_};
+    auto storage = leaf_allocator_traits::allocate(allocator, 1);
+    leaf_node *result = std::to_address(storage);
     try {
-      node_allocator_traits::construct(allocator, result, leaf);
+      leaf_allocator_traits::construct(allocator, result);
     } catch (...) {
-      node_allocator_traits::deallocate(allocator, result, 1);
+      leaf_allocator_traits::deallocate(allocator, storage, 1);
       throw;
     }
     return result;
   }
 
+  [[nodiscard]] internal_node *create_internal() {
+    internal_allocator allocator{allocator_};
+    auto storage = internal_allocator_traits::allocate(allocator, 1);
+    internal_node *result = std::to_address(storage);
+    try {
+      internal_allocator_traits::construct(allocator, result);
+    } catch (...) {
+      internal_allocator_traits::deallocate(allocator, storage, 1);
+      throw;
+    }
+    return result;
+  }
+
+  void destroy_leaf(leaf_node *current) noexcept {
+    leaf_allocator allocator{allocator_};
+    const auto storage =
+        std::pointer_traits<typename leaf_allocator_traits::pointer>::pointer_to(*current);
+    leaf_allocator_traits::destroy(allocator, current);
+    leaf_allocator_traits::deallocate(allocator, storage, 1);
+  }
+
+  void destroy_internal(internal_node *current) noexcept {
+    internal_allocator allocator{allocator_};
+    const auto storage =
+        std::pointer_traits<typename internal_allocator_traits::pointer>::pointer_to(*current);
+    internal_allocator_traits::destroy(allocator, current);
+    internal_allocator_traits::deallocate(allocator, storage, 1);
+  }
+
   void destroy_node(node *current) noexcept {
-    node_allocator allocator{allocator_};
-    node_allocator_traits::destroy(allocator, current);
-    node_allocator_traits::deallocate(allocator, current, 1);
+    if (current->is_leaf) {
+      destroy_leaf(static_cast<leaf_node *>(current));
+    } else {
+      destroy_internal(static_cast<internal_node *>(current));
+    }
   }
 
   void destroy_subtree(node *current) noexcept {
@@ -762,41 +757,36 @@ private:
       return;
     }
     if (!current->is_leaf) {
+      auto *internal = static_cast<internal_node *>(current);
       for (size_type i = 0; i < current->count; ++i) {
-        destroy_subtree(current->children[i]);
+        destroy_subtree(internal->children[i]);
       }
     }
     destroy_node(current);
   }
 
   [[nodiscard]] static constexpr key_type subtree_min(const node *current) noexcept {
-    while (!current->is_leaf) {
-      current = current->children[0];
-    }
-    assert(current->count != 0);
-    return current->keys[0];
+    assert(current != nullptr && current->count != 0);
+    return current->minimum;
   }
 
-  static constexpr void refresh(node *current) noexcept {
+  static void refresh(node *current) noexcept {
     if (current->is_leaf) {
-      current->index.rebuild(key_span(current));
+      auto *leaf = static_cast<leaf_node *>(current);
+      current->minimum = leaf->keys[0];
+      current->index.rebuild(key_span(leaf));
       return;
     }
+    auto *internal = static_cast<internal_node *>(current);
     assert(current->count >= 1 && current->count <= Branching);
+    current->minimum = internal->children[0]->minimum;
     for (size_type i = 1; i < current->count; ++i) {
-      current->keys[i - 1U] = subtree_min(current->children[i]);
+      internal->keys[i - 1U] = internal->children[i]->minimum;
     }
-    current->index.rebuild(internal_key_span(current));
+    current->index.rebuild(internal_key_span(internal));
   }
 
-  static constexpr void refresh_upward(node *current) noexcept {
-    while (current != nullptr) {
-      refresh(current);
-      current = current->parent;
-    }
-  }
-
-  [[nodiscard]] static constexpr size_type index_of_child(const node *parent,
+  [[nodiscard]] static constexpr size_type index_of_child(const internal_node *parent,
                                                           const node *child) noexcept {
     for (size_type i = 0; i < parent->count; ++i) {
       if (parent->children[i] == child) {
@@ -807,21 +797,22 @@ private:
     return 0;
   }
 
-  [[nodiscard]] node *find_leaf(key_type key) noexcept {
-    return const_cast<node *>(std::as_const(*this).find_leaf(key));
+  [[nodiscard]] leaf_node *find_leaf(key_type key) noexcept {
+    return const_cast<leaf_node *>(std::as_const(*this).find_leaf(key));
   }
 
-  [[nodiscard]] const node *find_leaf(key_type key) const noexcept {
+  [[nodiscard]] const leaf_node *find_leaf(key_type key) const noexcept {
     const node *current = root_;
     while (!current->is_leaf) {
-      const auto child = current->index.upper_bound(internal_key_span(current), key);
-      current = current->children[child];
+      const auto *internal = static_cast<const internal_node *>(current);
+      const auto child = current->index.upper_bound(internal_key_span(internal), key);
+      current = internal->children[child];
     }
-    return current;
+    return static_cast<const leaf_node *>(current);
   }
 
-  static constexpr void insert_key(node *leaf, size_type position, key_type key) noexcept {
-    assert(leaf->is_leaf && position <= leaf->count && leaf->count <= Branching);
+  static constexpr void insert_key(leaf_node *leaf, size_type position, key_type key) noexcept {
+    assert(position <= leaf->count && leaf->count <= Branching);
     for (size_type i = leaf->count; i > position; --i) {
       leaf->keys[i] = leaf->keys[i - 1U];
     }
@@ -829,30 +820,134 @@ private:
     ++leaf->count;
   }
 
+  [[nodiscard]] iterator insert_into_full_leaf(leaf_node *leaf, size_type position, key_type key) {
+    constexpr auto maximum_allocations = std::numeric_limits<size_type>::digits + 2U;
+    std::array<node *, maximum_allocations> prepared{};
+    size_type prepared_count = 0;
+
+    try {
+      prepared[prepared_count++] = create_leaf();
+      internal_node *first_non_full = leaf->parent;
+      while (first_non_full != nullptr && first_non_full->count == Branching) {
+        prepared[prepared_count++] = create_internal();
+        first_non_full = first_non_full->parent;
+      }
+      if (first_non_full == nullptr) {
+        prepared[prepared_count++] = create_internal();
+      }
+    } catch (...) {
+      while (prepared_count != 0) {
+        destroy_node(prepared[--prepared_count]);
+      }
+      throw;
+    }
+
+    size_type used = 0;
+    const auto take_prepared = [&]() noexcept -> node * {
+      assert(used < prepared_count);
+      return prepared[used++];
+    };
+
+    const bool minimum_changed = position == 0;
+    insert_key(leaf, position, key);
+    leaf_node *result_leaf = nullptr;
+    size_type result_position = 0;
+    node *current = leaf;
+
+    while (current->count > Branching) {
+      node *right = take_prepared();
+      const bool splitting_leaf = current->is_leaf;
+      split_node(current, right);
+      if (splitting_leaf) {
+        constexpr auto left_count = (Branching + 1U) / 2U;
+        if (position < left_count) {
+          result_leaf = static_cast<leaf_node *>(current);
+          result_position = position;
+        } else {
+          result_leaf = static_cast<leaf_node *>(right);
+          result_position = position - left_count;
+        }
+      }
+
+      internal_node *parent = current->parent;
+      if (parent == nullptr) {
+        auto *new_root = static_cast<internal_node *>(take_prepared());
+        new_root->count = 2;
+        new_root->children[0] = current;
+        new_root->children[1] = right;
+        current->parent = new_root;
+        right->parent = new_root;
+        refresh(new_root);
+        root_ = new_root;
+        break;
+      }
+
+      const auto child_position = index_of_child(parent, current);
+      for (size_type i = parent->count; i > child_position + 1U; --i) {
+        parent->children[i] = parent->children[i - 1U];
+      }
+      parent->children[child_position + 1U] = right;
+      right->parent = parent;
+      ++parent->count;
+
+      if (parent->count <= Branching) {
+        refresh(parent);
+        break;
+      }
+      current = parent;
+    }
+
+    assert(used == prepared_count && result_leaf != nullptr);
+    if (minimum_changed) {
+      propagate_minimum(leaf);
+    }
+    ++size_;
+    return iterator{this, result_leaf, result_position};
+  }
+
+  static void propagate_minimum(node *current) noexcept {
+    const auto minimum = current->minimum;
+    while (current->parent != nullptr) {
+      internal_node *parent = current->parent;
+      const auto position = index_of_child(parent, current);
+      if (position != 0) {
+        parent->keys[position - 1U] = minimum;
+        parent->index.rebuild(internal_key_span(parent));
+        return;
+      }
+      parent->minimum = minimum;
+      current = parent;
+    }
+  }
+
   void split_node(node *left, node *right) noexcept {
     assert(left->count == Branching + 1U);
-    right->is_leaf = left->is_leaf;
+    assert(right->is_leaf == left->is_leaf);
     right->parent = left->parent;
 
     const auto left_count = static_cast<size_type>((Branching + 1U) / 2U);
     const auto right_count = static_cast<size_type>(left->count) - left_count;
 
     if (left->is_leaf) {
+      auto *left_leaf = static_cast<leaf_node *>(left);
+      auto *right_leaf = static_cast<leaf_node *>(right);
       for (size_type i = 0; i < right_count; ++i) {
-        right->keys[i] = left->keys[left_count + i];
+        right_leaf->keys[i] = left_leaf->keys[left_count + i];
       }
-      right->previous = left;
-      right->next = left->next;
-      if (right->next != nullptr) {
-        right->next->previous = right;
+      right_leaf->previous = left_leaf;
+      right_leaf->next = left_leaf->next;
+      if (right_leaf->next != nullptr) {
+        right_leaf->next->previous = right_leaf;
       } else {
-        last_leaf_ = right;
+        last_leaf_ = right_leaf;
       }
-      left->next = right;
+      left_leaf->next = right_leaf;
     } else {
+      auto *left_internal = static_cast<internal_node *>(left);
+      auto *right_internal = static_cast<internal_node *>(right);
       for (size_type i = 0; i < right_count; ++i) {
-        right->children[i] = left->children[left_count + i];
-        right->children[i]->parent = right;
+        right_internal->children[i] = left_internal->children[left_count + i];
+        right_internal->children[i]->parent = right_internal;
       }
     }
 
@@ -862,21 +957,28 @@ private:
     refresh(right);
   }
 
-  void rebalance_after_erase(node *current) noexcept {
+  void rebalance_after_erase(node *current, bool minimum_changed) noexcept {
     while (current != root_ && current->count < minimum_occupancy) {
-      node *parent = current->parent;
+      internal_node *parent = current->parent;
       const auto position = index_of_child(parent, current);
+      const bool parent_minimum_changed = minimum_changed && position == 0;
       node *left = position == 0 ? nullptr : parent->children[position - 1U];
       node *right = position + 1U == parent->count ? nullptr : parent->children[position + 1U];
 
       if (left != nullptr && left->count > minimum_occupancy) {
         borrow_from_left(left, current);
-        refresh_upward(parent);
+        refresh(parent);
+        if (parent_minimum_changed) {
+          propagate_minimum(parent);
+        }
         return;
       }
       if (right != nullptr && right->count > minimum_occupancy) {
         borrow_from_right(current, right);
-        refresh_upward(parent);
+        refresh(parent);
+        if (parent_minimum_changed) {
+          propagate_minimum(parent);
+        }
         return;
       }
 
@@ -898,34 +1000,37 @@ private:
           new_root->parent = nullptr;
           root_ = new_root;
           destroy_node(parent);
-        } else {
-          refresh_upward(parent);
         }
         return;
       }
       if (parent->count >= minimum_occupancy) {
-        refresh_upward(parent);
+        if (parent_minimum_changed) {
+          propagate_minimum(parent);
+        }
         return;
       }
       current = parent;
+      minimum_changed = parent_minimum_changed;
     }
-
-    refresh_upward(current);
   }
 
-  static constexpr void borrow_from_left(node *left, node *current) noexcept {
+  static void borrow_from_left(node *left, node *current) noexcept {
     assert(left->is_leaf == current->is_leaf && left->count > minimum_occupancy);
     if (current->is_leaf) {
+      auto *left_leaf = static_cast<leaf_node *>(left);
+      auto *current_leaf = static_cast<leaf_node *>(current);
       for (size_type i = current->count; i > 0; --i) {
-        current->keys[i] = current->keys[i - 1U];
+        current_leaf->keys[i] = current_leaf->keys[i - 1U];
       }
-      current->keys[0] = left->keys[left->count - 1U];
+      current_leaf->keys[0] = left_leaf->keys[left->count - 1U];
     } else {
+      auto *left_internal = static_cast<internal_node *>(left);
+      auto *current_internal = static_cast<internal_node *>(current);
       for (size_type i = current->count; i > 0; --i) {
-        current->children[i] = current->children[i - 1U];
+        current_internal->children[i] = current_internal->children[i - 1U];
       }
-      current->children[0] = left->children[left->count - 1U];
-      current->children[0]->parent = current;
+      current_internal->children[0] = left_internal->children[left->count - 1U];
+      current_internal->children[0]->parent = current_internal;
     }
     --left->count;
     ++current->count;
@@ -933,18 +1038,22 @@ private:
     refresh(current);
   }
 
-  static constexpr void borrow_from_right(node *current, node *right) noexcept {
+  static void borrow_from_right(node *current, node *right) noexcept {
     assert(right->is_leaf == current->is_leaf && right->count > minimum_occupancy);
     if (current->is_leaf) {
-      current->keys[current->count] = right->keys[0];
+      auto *current_leaf = static_cast<leaf_node *>(current);
+      auto *right_leaf = static_cast<leaf_node *>(right);
+      current_leaf->keys[current->count] = right_leaf->keys[0];
       for (size_type i = 1; i < right->count; ++i) {
-        right->keys[i - 1U] = right->keys[i];
+        right_leaf->keys[i - 1U] = right_leaf->keys[i];
       }
     } else {
-      current->children[current->count] = right->children[0];
-      current->children[current->count]->parent = current;
+      auto *current_internal = static_cast<internal_node *>(current);
+      auto *right_internal = static_cast<internal_node *>(right);
+      current_internal->children[current->count] = right_internal->children[0];
+      current_internal->children[current->count]->parent = current_internal;
       for (size_type i = 1; i < right->count; ++i) {
-        right->children[i - 1U] = right->children[i];
+        right_internal->children[i - 1U] = right_internal->children[i];
       }
     }
     ++current->count;
@@ -957,27 +1066,31 @@ private:
     assert(left->is_leaf == right->is_leaf && left->count + right->count <= Branching);
     const auto offset = static_cast<size_type>(left->count);
     if (left->is_leaf) {
+      auto *left_leaf = static_cast<leaf_node *>(left);
+      auto *right_leaf = static_cast<leaf_node *>(right);
       for (size_type i = 0; i < right->count; ++i) {
-        left->keys[offset + i] = right->keys[i];
+        left_leaf->keys[offset + i] = right_leaf->keys[i];
       }
-      left->next = right->next;
-      if (right->next != nullptr) {
-        right->next->previous = left;
+      left_leaf->next = right_leaf->next;
+      if (right_leaf->next != nullptr) {
+        right_leaf->next->previous = left_leaf;
       } else {
-        last_leaf_ = left;
+        last_leaf_ = left_leaf;
       }
     } else {
+      auto *left_internal = static_cast<internal_node *>(left);
+      auto *right_internal = static_cast<internal_node *>(right);
       for (size_type i = 0; i < right->count; ++i) {
-        left->children[offset + i] = right->children[i];
-        left->children[offset + i]->parent = left;
+        left_internal->children[offset + i] = right_internal->children[i];
+        left_internal->children[offset + i]->parent = left_internal;
       }
     }
     left->count = static_cast<std::uint8_t>(left->count + right->count);
     refresh(left);
   }
 
-  static constexpr void remove_child(node *parent, size_type position) noexcept {
-    assert(!parent->is_leaf && position < parent->count);
+  static constexpr void remove_child(internal_node *parent, size_type position) noexcept {
+    assert(position < parent->count);
     for (size_type i = position + 1U; i < parent->count; ++i) {
       parent->children[i - 1U] = parent->children[i];
     }
@@ -993,8 +1106,8 @@ private:
 
   [[no_unique_address]] Allocator allocator_{};
   node *root_{};
-  node *first_leaf_{};
-  node *last_leaf_{};
+  leaf_node *first_leaf_{};
+  leaf_node *last_leaf_{};
   size_type size_{};
 };
 
